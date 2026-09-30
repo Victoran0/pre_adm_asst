@@ -1,57 +1,131 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport } from "ai";
+import { DefaultChatTransport, type UIMessage } from "ai";
 import { Send, StopCircle } from "lucide-react";
 
 /**
- * NHS Pre-Admission intake chat (patient-facing UI).
+ * NHS Pre-Admission intake chat (patient-facing UI), wired to the FastAPI backend.
  *
- * Vercel AI SDK v5:
- *  - endpoint via transport: new DefaultChatTransport({ api })
- *  - manage input yourself; send with sendMessage({ text })
- *  - message text lives in m.parts (filter type === "text"), not m.content
+ * Flow:
+ *  1. On load: POST /api/session/start with this chat's id -> GPT-4o greeting (HLD §5.1 step 1).
+ *  2. Each message: POST /api/chat, streamed back in the Vercel AI SDK v5 UI message stream format.
+ *     - text parts: the assistant's replies, appearing as each agent finishes
+ *     - data-status (transient): "Finding the right department..." while agents work
+ *     - data-phase (transient): drives the step indicator and the Yes/No buttons
  *
- * Plain React (Vite). Theming is self-contained in the <style> block below
- * using NHS Design System hex values, so it does NOT depend on tailwind.config.
- * Set VITE_API_BASE in your .env (e.g. https://<apim>.azure-api.net).
+ * Set VITE_API_BASE in .env (http://localhost:8000 locally, https://<apim>.azure-api.net in Azure).
  */
 
-const STAGE_LABELS = [
-  "Step 1 of 3: Collecting your details",
-  "Step 2 of 3: Finding the right department",
-  "Step 3 of 3: Confirming your department",
-] as const;
+const API_BASE = import.meta.env.VITE_API_BASE;
+
+type Phase = "intake" | "routing" | "awaiting_confirmation" | "completed" | "escalated";
+
+const STAGE_LABELS: Record<Phase, string> = {
+  intake: "Step 1 of 3: Collecting your details",
+  routing: "Step 2 of 3: Finding the right department",
+  awaiting_confirmation: "Step 3 of 3: Confirming your department",
+  completed: "Complete: your details have been sent",
+  escalated: "A receptionist will contact you",
+};
 
 export default function ChatInterface({ sessionToken }: { sessionToken?: string }) {
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const streamingRef = useRef(false);
+  const started = useRef(false);
+  const [chatId] = useState(() => crypto.randomUUID()); // also the backend session id
   const [input, setInput] = useState("");
+  const [phase, setPhase] = useState<Phase>("intake");
+  const [statusText, setStatusText] = useState<string | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
 
-  const { messages, status, stop, sendMessage } = useChat({
-    transport: new DefaultChatTransport({
-      api: `${import.meta.env.VITE_API_BASE}/api/chat`,
-      headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : undefined,
-    }),
+  const authHeaders = useMemo(() => {
+    const h: Record<string, string> = {};
+    if (sessionToken) h.Authorization = `Bearer ${sessionToken}`;
+    return h;
+  }, [sessionToken]);
+
+  const transport = useMemo(
+    () =>
+      new DefaultChatTransport({
+        api: `${API_BASE}/api/chat`,
+        headers: authHeaders,
+        // The backend keeps the conversation state, so only the newest message is sent.
+        prepareSendMessagesRequest: ({ id, messages }) => ({
+          body: { id, message: messages[messages.length - 1] },
+        }),
+      }),
+    [authHeaders],
+  );
+
+  const { messages, setMessages, status, stop, sendMessage, error } = useChat({
+    id: chatId,
+    transport,
+    onData: (part) => {
+      if (part.type === "data-status") setStatusText((part.data as { text: string }).text);
+      if (part.type === "data-phase") setPhase((part.data as { phase: Phase }).phase);
+    },
+    onFinish: () => setStatusText(null),
+    onError: () => setStatusText(null),
   });
 
+  // Step 1: create the backend session and show the GPT-4o greeting.
+  useEffect(() => {
+    if (started.current) return; // React StrictMode runs effects twice in development
+    started.current = true;
+    fetch(`${API_BASE}/api/session/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders },
+      body: JSON.stringify({ session_id: chatId }),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((data: { reply: string; phase: Phase }) => {
+        setPhase(data.phase);
+        setMessages([
+          { id: "greeting", role: "assistant", parts: [{ type: "text", text: data.reply }] } as UIMessage,
+        ]);
+      })
+      .catch(() => setStartError("Sorry, the assistant is unavailable right now. Please try again later."));
+  }, [chatId, authHeaders, setMessages]);
+
   const isLoading = status === "submitted" || status === "streaming";
+  const greetingLoaded = messages.length > 0;
+  const sessionClosed = phase === "completed" || phase === "escalated";
+  const canType = greetingLoaded && !sessionClosed && !startError;
+
+  // Keep the newest content fully in view: scroll to the very bottom whenever the message area changes size
+  // (message sent, reply streaming in, typing indicator, Yes/No buttons, errors).
+  streamingRef.current = status === "streaming";
 
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, status]);
+    const el = messagesRef.current;
+    if (!el) return;
+    const scrollToBottom = () =>
+      window.scrollTo({
+        top: document.documentElement.scrollHeight,
+        behavior: streamingRef.current ? "auto" : "smooth", // instant while words stream in, smooth otherwise
+      });
+    const observer = new ResizeObserver(scrollToBottom);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
-  const assistantTurns = messages.filter((m) => m.role === "assistant").length;
-  const stageIndex = assistantTurns >= 4 ? 2 : assistantTurns >= 1 ? 1 : 0;
+  function send(text: string) {
+    if (!text.trim() || isLoading || !canType) return;
+    sendMessage({ text });
+  }
 
   function submit(e: React.FormEvent) {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
-    sendMessage({ text: input });
+    send(input);
     setInput("");
   }
 
   return (
     <div className="nhs-chat">
-      <style>{NHS_CSS}</style>
+      <style>{NHS_CSS + NHS_CSS_EXTRA}</style>
 
       <header className="nhs-chat__header">
         <div className="nhs-chat__header-inner">
@@ -73,33 +147,44 @@ export default function ChatInterface({ sessionToken }: { sessionToken?: string 
             number. Use a patient reference such as PT-0042.
           </p>
 
-          <div className="nhs-chat__stage">
-            <strong>{STAGE_LABELS[stageIndex]}</strong>
+          <div className="nhs-chat__stage" aria-live="polite">
+            <strong>{STAGE_LABELS[phase]}</strong>
           </div>
 
-          <div className="nhs-chat__messages">
-            <Bubble role="assistant">
-              Hello, and welcome. I'll help get you ready for your appointment.
-              This takes about two minutes. To start, what is your patient
-              reference? It looks like PT-0042.
-            </Bubble>
+          <div className="nhs-chat__messages" aria-live="polite" ref={messagesRef}>
+            {!greetingLoaded && !startError && <Typing label="Starting your session..." />}
+            {startError && <div className="nhs-chat__error">{startError}</div>}
 
             {messages.map((m) => {
-              const text = (m as any).parts
-                ? (m as any).parts
-                    .filter((p: any) => p.type === "text")
-                    .map((p: any) => p.text)
-                    .join("")
-                : (m as any).content;
-              return (
+              const text = m.parts
+                .filter((p) => p.type === "text")
+                .map((p) => (p as { text: string }).text)
+                .join("\n\n");
+              return text ? (
                 <Bubble key={m.id} role={m.role}>
                   {text}
                 </Bubble>
-              );
+              ) : null;
             })}
 
-            {isLoading && messages.at(-1)?.role === "user" && <Typing />}
-            <div ref={scrollRef} />
+            {isLoading && <Typing label={statusText} />}
+
+            {phase === "awaiting_confirmation" && !isLoading && (
+              <div className="nhs-chat__quick">
+                <button type="button" className="nhs-btn" onClick={() => send("Yes")}>
+                  Yes, that's right
+                </button>
+                <button type="button" className="nhs-btn nhs-btn--secondary" onClick={() => send("No")}>
+                  No
+                </button>
+              </div>
+            )}
+
+            {error && (
+              <div className="nhs-chat__error">
+                Something went wrong sending your message. Please try again.
+              </div>
+            )}
           </div>
         </div>
       </main>
@@ -113,16 +198,17 @@ export default function ChatInterface({ sessionToken }: { sessionToken?: string 
             id="chat-input"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Type your answer..."
+            placeholder={sessionClosed ? "This session has ended" : "Type your answer..."}
             autoComplete="off"
             className="nhs-chat__input"
+            disabled={!canType}
           />
           {isLoading ? (
             <button type="button" onClick={stop} className="nhs-btn nhs-btn--secondary">
               <StopCircle size={18} /> Stop
             </button>
           ) : (
-            <button type="submit" disabled={!input.trim()} className="nhs-btn">
+            <button type="submit" disabled={!input.trim() || !canType} className="nhs-btn">
               <Send size={18} /> Send
             </button>
           )}
@@ -145,10 +231,11 @@ function Bubble({ role, children }: { role: string; children: React.ReactNode })
   );
 }
 
-function Typing() {
+function Typing({ label }: { label?: string | null }) {
   return (
     <div className="nhs-msg nhs-msg--assistant nhs-typing">
-      <span /> <span /> <span />
+      <span className="nhs-typing__dot" /> <span className="nhs-typing__dot" /> <span className="nhs-typing__dot" />
+      {label && <em className="nhs-typing__label">{label}</em>}
     </div>
   );
 }
@@ -222,4 +309,17 @@ const NHS_CSS = `
 .nhs-btn--secondary { background:#fff; color:var(--nhs-black); border:2px solid var(--nhs-black);
   box-shadow:0 4px 0 var(--nhs-mid-grey); }
 .nhs-btn--secondary:hover { background:var(--nhs-pale-grey); }
+`;
+
+
+const NHS_CSS_EXTRA = `
+.nhs-typing .nhs-typing__dot { width:8px; height:8px; border-radius:50%; background:var(--nhs-mid-grey);
+  animation:nhsBounce 1.2s infinite ease-in-out; }
+.nhs-typing .nhs-typing__dot:nth-child(2){ animation-delay:.15s; }
+.nhs-typing .nhs-typing__dot:nth-child(3){ animation-delay:.3s; }
+.nhs-typing__label { margin-left:8px; font-size:14px; color:var(--nhs-dark-grey); font-style:normal; }
+.nhs-chat__quick { display:flex; gap:12px; align-self:flex-start; }
+.nhs-chat__error { background:#fff; border-left:4px solid var(--nhs-red); padding:10px 14px;
+  font-size:14px; color:var(--nhs-black); }
+.nhs-chat__input:disabled { background:var(--nhs-pale-grey); cursor:not-allowed; }
 `;
